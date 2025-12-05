@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="SOTD API")
 
-# Add CORS to allow requests from anywhere (including Shortcuts)
+# CORS: allow iOS Shortcuts or anything else to call this easily
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,6 +15,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+STORAGE_FILE = "sotd_data.json"
+
 
 class SOTD(BaseModel):
     entry_number: int
@@ -25,71 +28,105 @@ class SOTD(BaseModel):
     playlist_url: str
     image_url: Optional[str] = None
 
-STORAGE_FILE = "sotd_data.json"
 
-def load_sotd() -> SOTD:
-    """Load SOTD from JSON file. If no file exists, return default data."""
-    default_sotd = SOTD(
-        entry_number=0,
-        date="1970-01-01",
-        title="No SOTD yet",
-        artist="",
-        track_url="https://open.spotify.com",
-        playlist_url="https://open.spotify.com/playlist/7vas6ruuKqAAdM7xXxbpTE",
-        image_url=None
-    )
-    
+LATEST_SOTD: Optional[SOTD] = None
+
+
+def load_from_disk() -> Optional[SOTD]:
+    """Load the last saved SOTD from disk, if present."""
+    if not os.path.exists(STORAGE_FILE):
+        return None
     try:
-        if os.path.exists(STORAGE_FILE):
-            with open(STORAGE_FILE, "r") as f:
-                data = json.load(f)
-                # Convert loaded data back to SOTD object
-                return SOTD(**data)
+        with open(STORAGE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return SOTD(**data)
     except Exception as e:
-        print(f"Error loading SOTD data: {e}")
-    
-    return default_sotd
+        print("Failed to load SOTD from disk:", e)
+        return None
 
-def save_sotd(sotd: SOTD):
-    """Save SOTD to JSON file."""
+
+def save_to_disk(sotd: SOTD) -> None:
+    """Persist SOTD to a JSON file."""
     try:
-        with open(STORAGE_FILE, "w") as f:
-            json.dump(sotd.dict(), f, indent=2)
-        print(f"SOTD saved: {sotd.title}")
+        with open(STORAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(sotd.model_dump(), f, indent=2)
     except Exception as e:
-        print(f"Error saving SOTD data: {e}")
+        print("Failed to save SOTD to disk:", e)
 
-# Load the current SOTD from file when the app starts
-LATEST_SOTD = load_sotd()
+
+# Initialize in-memory state on startup
+@app.on_event("startup")
+def startup_event():
+    global LATEST_SOTD
+    LATEST_SOTD = load_from_disk()
+    if LATEST_SOTD:
+        print(f"Loaded SOTD from disk: {LATEST_SOTD.title} ({LATEST_SOTD.date})")
+    else:
+        print("No existing SOTD found on disk.")
+
+
+@app.get("/")
+def root():
+    """Basic info endpoint."""
+    return {
+        "message": "MGW Song of the Day API",
+        "has_current": LATEST_SOTD is not None,
+    }
+
 
 @app.get("/current")
 def get_current():
-    """Return the current SOTD data."""
+    """
+    Return the current SOTD.
+    This is what your iOS Shortcuts should call.
+    """
+    global LATEST_SOTD
+
+    if LATEST_SOTD is None:
+        # if possible, try to lazy-load from disk
+        loaded = load_from_disk()
+        if loaded:
+            LATEST_SOTD = loaded
+        else:
+            return {"error": "No SOTD set yet."}
+
     return LATEST_SOTD
+
 
 @app.post("/update")
 def update_sotd(sotd: SOTD):
-    """Update the SOTD data and save to file."""
+    """
+    Update the current SOTD.
+    Called by your Discord bot whenever a new SOTD is posted,
+    or when you run /update_api to re-send the same one.
+    """
     global LATEST_SOTD
     LATEST_SOTD = sotd
-    save_sotd(sotd)
-    return {"status": "updated", "song": sotd.title}
+    save_to_disk(sotd)
+    return {"status": "ok", "message": "SOTD updated.", "title": sotd.title}
+
 
 @app.get("/health")
-def health_check():
-    """Health check endpoint for monitoring services."""
+def health():
+    """
+    Simple health endpoint so you (and Render) can see if the app is alive.
+    """
     return {
-        "status": "healthy", 
-        "current_sotd": LATEST_SOTD.title,
-        "entry": LATEST_SOTD.entry_number,
-        "file_exists": os.path.exists(STORAGE_FILE)
+        "status": "healthy",
+        "current_sotd": LATEST_SOTD.title if LATEST_SOTD else None,
+        "entry": LATEST_SOTD.entry_number if LATEST_SOTD else None,
+        "file_exists": os.path.exists(STORAGE_FILE),
     }
+
 
 @app.get("/wakeup")
 def wakeup():
-    """Simple endpoint to wake up the app."""
-    return {"message": "API is awake", "song": LATEST_SOTD.title}
+    """Simple endpoint to wake up the app (used by /wakeup command on the bot)."""
+    title = LATEST_SOTD.title if LATEST_SOTD else None
+    return {"message": "API is awake", "song": title}
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
